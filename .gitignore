@@ -1,0 +1,26 @@
+# Pycache
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Results / checkpoints
+results_*/
+*.pt
+logs/
+
+# Data (too large to ship; see README "Data" section)
+data/utsd/
+data/utsd_repo/
+data/ETT-small/
+data/electricity/
+data/traffic/
+data/weather/
+data/Exchange/
+data/ILI/
+data/ECL/
+data/Solar/
+
+# IDE
+.idea/
+.vscode/
+.DS_Store
