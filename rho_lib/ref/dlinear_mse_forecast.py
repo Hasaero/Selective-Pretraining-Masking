@@ -1,28 +1,8 @@
-"""Moirai-aligned MSE-selection reference: DLinear that produces a POINT
-prediction (single mean) for each suffix timestep, trained with MSE.
+"""DLinear point-prediction reference trained with MSE.
 
-Used by Moirai's RHO-CM in MSE-selection mode:
-- The Moirai model still trains with Mixture NLL as gradient (unchanged).
-- But the ρ score that decides which tokens to drop is computed from
-  point-prediction MSE: ρ[t] = current_MSE[t] − ref_MSE[t].
-- ref_MSE comes from this DLinear MSE forecaster (per-time-step squared
-  error of point prediction).
-
-Why this is preferable to a Mixture-NLL ref:
-- Same loss family (MSE) on both sides → semantically clean ranking.
-- No mixture distribution to fit — eliminates NaN risk that plagued the
-  Mixture-NLL ref (no clamp/sanitize needed).
-- 6× fewer params (one Linear, not Linear×12), trains 2× faster.
-- Selection metric aligns with eval metric (zero-shot MSE/MAE).
-
-Architecture:
-    DLinear single-head: lookback (L) → suffix prediction (S timesteps)
-    Self-standardize-by-lookback (matches Moirai's PackedStdScaler on
-    observed positions). Project lookback → suffix predictions, MSE on
-    suffix only.
-
-Table layout (compatible with existing RHO lookup):
-    (N, C99, T) per-time-step MSE — suffix region only, lookback = 0.
+Used by TimesFM for SPM selection: the reference's per-timestep squared
+error is compared against the foundation model's own squared error to
+compute rho = current_MSE - ref_MSE (both in identical units).
 """
 import random
 
@@ -43,7 +23,7 @@ _TRAIN_MAX_RATIO = 0.50
 class DLinearMSEForecastRef(nn.Module):
     """Plain Linear MSE forecaster: lookback → suffix point predictions.
 
-    Trained with MSE on the suffix region. Compared against Moirai's point
+    Trained with MSE on the suffix region. Compared against the foundation model's point
     prediction (mixture.mean) to compute MSE-based ρ.
     """
 
@@ -153,7 +133,7 @@ def build_ref_model_only(
     """Train the DLinear MSE forecaster and return the model itself
     (without building a static (N, C99, T) ref table).
 
-    Used by Moirai 'live' ref mode: instead of caching ref MSE for a single
+    Live ref mode: instead of caching ref MSE for a single
     fixed suffix ratio (0.30), the model is run per-batch with the actual
     sample-specific lookback/suffix split. Trades extra compute (~ref-forward
     per batch) for ratio-accurate ref MSE.

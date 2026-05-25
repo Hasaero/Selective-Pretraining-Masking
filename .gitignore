@@ -24,3 +24,7 @@ data/Solar/
 .idea/
 .vscode/
 .DS_Store
+
+# Symlinked dataset paths (user-specific; reproduce by downloading to data/)
+data/*
+!data/.gitkeep

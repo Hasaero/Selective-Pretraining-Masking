@@ -1,4 +1,4 @@
-"""RHO mask computation — shared across moirai/moment/timer.
+"""RHO mask computation — shared across Timer, MOMENT, TimesFM.
 
 `rho = current_loss - ref_loss` over an arbitrary tensor shape; we keep entries
 above the bottom drop_pct% threshold (i.e. drop the easiest fraction, where

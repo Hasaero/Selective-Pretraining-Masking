@@ -1,25 +1,35 @@
-"""
-MOMENT Pretraining with patch-level RHO-CM masking.
+"""MOMENT pretraining (baseline + SPM variants).
 
-Baseline      : MOMENT-small + random 30% patch mask (MAE objective)
-patch_rho_cm  : MOMENT-small + per-(sample, channel, patch) RHO weighting
-                rho[i, c, p] = current_recon_loss[i, c, p] - ref_loss[i, c, p]
-                Drop bottom drop_pct% of (i, c, p) triples per batch.
-                ref = DLinear trained briefly (ref_epochs) on the same corpus.
+Architecture
+------------
+BERT-style encoder with patch-level reconstruction (MAE objective).
+`AutonLab/MOMENT-1-{small,base,large}`, channel-independent.
 
-Usage
+Modes
 -----
-# Baseline (random mask only)
-python scripts/pretrain_moment.py --mode baseline --epochs 2 --batch-size 64
+- baseline          : default MOMENT random 30% patch mask.
+- patch_rho_cm      : SPM with top-K drop_pct selection on
+                      ρ = current_recon_MSE − ref_recon_MSE per
+                      (sample, channel, patch).
+- threshold_rho     : SPM with calibrated τ (recommended).
+                      Keep patches with ρ > τ, τ fit on first
+                      `--calib-batches`.
+- random_mask       : random per-patch mask matching `--drop-pct` (ablation).
+- top_loss_drop     : drop highest-loss patches (ablation).
+- bottom_loss_drop  : drop lowest-loss patches (ablation).
 
-# Patch-level RHO-CM
-python scripts/pretrain_moment.py --mode patch_rho_cm --epochs 2 --batch-size 64 \
-    --ref-epochs 3 --drop-pct 10
+Reference model: DLinear masked-reconstruction
+(see rho_lib/ref/dlinear_recon_masked.py).
 
-# Evaluate (linear probe on ETTh1 forecasting)
-python scripts/pretrain_moment.py --mode eval \
-    --ckpt results_pretrain/patch_rho_cm/best.pt \
-    --eval-dataset ETTh1 --eval-horizon 96
+Eval
+----
+- eval, eval_sweep  : linear probe (frozen encoder + linear head) or
+                      full fine-tuning if --full-ft.
+
+Best config
+-----------
+baseline       : --epochs 1 --batch-size 1024 --lr 1e-4
+SPM (calib)    : same + --target-keep-pct 0.6 --calib-batches 200 --ref-epochs 2
 """
 
 import argparse
@@ -45,7 +55,10 @@ from momentfm import MOMENTPipeline
 
 # ── rho_lib (shared scaffolding) ──────────────────────────────────────────────
 from rho_lib.data.utsd     import (UTSDPretrainDataset, make_collate_fn,
-                                   load_utsd, compute_channel_cap)
+                                   load_utsd, compute_channel_cap,
+                                   UTSDPretrainDatasetUnivariate,
+                                   make_collate_fn_univariate,
+                                   load_or_build_cached_univariate)
 from rho_lib.data.forecast import prepare_forecast_datasets
 from rho_lib.ref.dlinear_recon_masked import (
     build_ref_model_masked,
@@ -159,6 +172,12 @@ def pretrain(
     seed: int,
     max_series: int | None,
     device: torch.device,
+    threshold_tau: float = 0.0,
+    univariate: bool = False,
+    model_size: str = 'small',
+    target_keep_pct: float | None = None,
+    calib_batches: int = 200,
+    save_every_n_steps: int | None = None,
 ):
     torch.manual_seed(seed)
     random.seed(seed)
@@ -167,21 +186,25 @@ def pretrain(
     out_dir.mkdir(parents=True, exist_ok=True)
 
     # ── Load dataset ──────────────────────────────────────────────────────────
-    print('[Data] Loading UTSD...')
-    hf_ds = load_utsd(UTSD_PATH, max_series=max_series)
-    print(f'[Data] {len(hf_ds):,} rows loaded')
-    dataset = UTSDPretrainDataset(
-        hf_ds, seq_len=SEQ_LEN, stride=SEQ_LEN,
-        max_series=max_series, standardize_per_series=True,  # MOMENT default
-    )
-
-    # Cap channels at the 99th percentile to bound effective forward batch
-    # size (B × C). Without this, heavy multivariate series (e.g. Traffic
-    # with 862 channels) cause OOM on a single batch even when the nominal
-    # batch_size is moderate. Random subset preserves coverage across epochs.
-    channel_cap = compute_channel_cap(dataset, percentile=99.0, per='window')
-    print(f'[Data] channel cap (p99): {channel_cap}')
-    collate_fn = make_collate_fn(SEQ_LEN, channel_cap=channel_cap)
+    if univariate:
+        dataset = load_or_build_cached_univariate(
+            UTSD_PATH, seq_len=SEQ_LEN, stride=SEQ_LEN,
+            standardize_per_series=True,
+            max_series=max_series,
+        )
+        print(f'[Data] univariate mode (SOM): {len(dataset)} windows, no channel cap')
+        collate_fn = make_collate_fn_univariate(SEQ_LEN)
+    else:
+        print('[Data] Loading UTSD...')
+        hf_ds = load_utsd(UTSD_PATH, max_series=max_series)
+        print(f'[Data] {len(hf_ds):,} rows loaded')
+        dataset = UTSDPretrainDataset(
+            hf_ds, seq_len=SEQ_LEN, stride=SEQ_LEN,
+            max_series=max_series, standardize_per_series=True,  # MOMENT default
+        )
+        channel_cap = compute_channel_cap(dataset, percentile=99.0, per='window')
+        print(f'[Data] channel cap (p99): {channel_cap}')
+        collate_fn = make_collate_fn(SEQ_LEN, channel_cap=channel_cap)
 
     loader = DataLoader(
         dataset,
@@ -194,10 +217,11 @@ def pretrain(
     )
     print(f'[Data] DataLoader ready: {len(loader)} batches')
 
-    # ── Load MOMENT-small (architecture only, random init) ───────────────────
-    print('[Model] Initializing MOMENT-1-small from scratch...')
+    # ── Load MOMENT architecture (random init) ───────────────────────────────
+    hf_repo = f'AutonLab/MOMENT-1-{model_size}'
+    print(f'[Model] Initializing {hf_repo} from scratch...')
     model = MOMENTPipeline.from_pretrained(
-        'AutonLab/MOMENT-1-small',
+        hf_repo,
         local_files_only=True,
         model_kwargs={
             'task_name': 'reconstruction',
@@ -229,7 +253,7 @@ def pretrain(
     # We apply MOMENT's actual per-step mask to the ref each batch so ρ uses
     # fully matched (sample, channel, patch) predictions. No N×C×P table.
     ref_model = None
-    if mode == 'patch_rho_cm':
+    if mode in ('patch_rho_cm', 'threshold_rho'):
         t0 = time.time()
         # ref bs fixed to 256 — DLinear is tiny, large batch reduces step count
         ref_model = build_ref_model_masked(
@@ -252,6 +276,39 @@ def pretrain(
     step_log_f = open(step_log_path, 'w')
     step_log_f.write('step,loss,kept_ratio\n')
     step_log_every = 5   # MOMENT has fewer steps (chunked forward), log denser
+
+    # ── Calibration ──────────────────────────────────────────────────────────
+    if mode == 'threshold_rho' and target_keep_pct is not None and ref_model is not None:
+        print(f'[Calib] target_keep_pct={target_keep_pct} '
+              f'collecting rho from first {calib_batches} batches...')
+        t0 = time.time()
+        rho_samples = []
+        model.eval()
+        with torch.no_grad():
+            for bi, (indices, x, ch_mask) in enumerate(loader):
+                if bi >= calib_batches:
+                    break
+                indices = indices.to(device, non_blocking=True)
+                x = x.to(device, non_blocking=True)
+                ch_mask = ch_mask.to(device, non_blocking=True)
+                B, C, T = x.shape
+                per_patch, pmask_bool = moment_recon_loss_per_patch(model, x, ch_mask)
+                Bx, Cx, Px = pmask_bool.shape
+                x_flat = x.reshape(Bx * Cx, T)
+                pmask_flat = (pmask_bool > 0.5).reshape(Bx * Cx, Px)
+                ref_pred = ref_model.predict_with_mask(x_flat, pmask_flat)
+                ref_sq = (ref_pred - x_flat) ** 2
+                ref_patch = ref_sq.reshape(
+                    Bx * Cx, Px, PATCH_LEN).mean(dim=2).reshape(Bx, Cx, Px)
+                rho_b = (per_patch - ref_patch).detach()
+                valid_b = ch_mask.unsqueeze(-1) & (pmask_bool > 0.5)
+                rho_samples.append(rho_b[valid_b].flatten().cpu())
+        model.train()
+        all_rho = torch.cat(rho_samples)
+        threshold_tau = torch.quantile(all_rho, 1.0 - target_keep_pct).item()
+        print(f'[Calib] threshold_tau={threshold_tau:.4f} (n_rho={len(all_rho)}, '
+              f'mean={all_rho.mean():.4f}, std={all_rho.std():.4f}) '
+              f'in {time.time()-t0:.1f}s')
 
     for epoch in range(epochs):
         model.train()
@@ -296,11 +353,51 @@ def pretrain(
                 loss = (per_patch * rho_patch_mask.float()).sum() / \
                        rho_patch_mask.float().sum().clamp(min=1)
 
+            elif mode == 'threshold_rho':
+                # Same ref computation as patch_rho_cm, but selection uses
+                # fixed threshold tau on rho instead of top-K drop_pct.
+                per_patch, pmask_bool = moment_recon_loss_per_patch(model, x, ch_mask)
+                Bx, Cx, Px = pmask_bool.shape
+                x_flat     = x.reshape(Bx * Cx, T)
+                pmask_flat = (pmask_bool > 0.5).reshape(Bx * Cx, Px)
+                with torch.no_grad():
+                    ref_pred  = ref_model.predict_with_mask(x_flat, pmask_flat)
+                    ref_sq    = (ref_pred - x_flat) ** 2
+                    ref_patch = ref_sq.reshape(
+                        Bx * Cx, Px, PATCH_LEN
+                    ).mean(dim=2).reshape(Bx, Cx, Px)
+                rho        = per_patch.detach() - ref_patch
+                valid_mask = ch_mask.unsqueeze(-1) & (pmask_bool > 0.5)
+                rho_patch_mask = valid_mask & (rho > threshold_tau)
+                kept_ratio = (rho_patch_mask.float().sum() /
+                              valid_mask.float().sum().clamp(min=1))
+                denom = rho_patch_mask.float().sum().clamp(min=1)
+                loss = (per_patch * rho_patch_mask.float()).sum() / denom
+
             elif mode == 'random_mask':
                 # Ablation: random rho instead of DLinear-based ranking.
-                # Tests whether SPM win is from selection or from random-drop regularization.
                 per_patch, pmask_bool = moment_recon_loss_per_patch(model, x, ch_mask)
                 rho = torch.rand_like(per_patch)
+                valid_mask = ch_mask.unsqueeze(-1) & (pmask_bool > 0.5)
+                rho_patch_mask = compute_rho_mask(rho, valid_mask, drop_pct)
+                kept_ratio = (rho_patch_mask.float().sum() /
+                              valid_mask.float().sum().clamp(min=1))
+                loss = (per_patch * rho_patch_mask.float()).sum() /                        rho_patch_mask.float().sum().clamp(min=1)
+
+            elif mode == 'top_loss_drop':
+                # Drop the HARDEST tokens (highest current loss).
+                per_patch, pmask_bool = moment_recon_loss_per_patch(model, x, ch_mask)
+                rho = -per_patch.detach()  # negate so compute_rho_mask drops top losses
+                valid_mask = ch_mask.unsqueeze(-1) & (pmask_bool > 0.5)
+                rho_patch_mask = compute_rho_mask(rho, valid_mask, drop_pct)
+                kept_ratio = (rho_patch_mask.float().sum() /
+                              valid_mask.float().sum().clamp(min=1))
+                loss = (per_patch * rho_patch_mask.float()).sum() /                        rho_patch_mask.float().sum().clamp(min=1)
+
+            elif mode == 'bottom_loss_drop':
+                # Drop the EASIEST tokens (lowest current loss).
+                per_patch, pmask_bool = moment_recon_loss_per_patch(model, x, ch_mask)
+                rho = per_patch.detach()  # rank by loss directly; lowest gets dropped
                 valid_mask = ch_mask.unsqueeze(-1) & (pmask_bool > 0.5)
                 rho_patch_mask = compute_rho_mask(rho, valid_mask, drop_pct)
                 kept_ratio = (rho_patch_mask.float().sum() /
@@ -324,6 +421,13 @@ def pretrain(
                 global_step = epoch * len(loader) + step_in_epoch
                 step_log_f.write(f'{global_step},{loss.item():.6f},{kept_ratio.item():.4f}\n')
                 step_log_f.flush()
+            # Step-level checkpoint for Rho-1 style learning curve
+            if save_every_n_steps is not None and (epoch * len(loader) + step_in_epoch) % save_every_n_steps == 0:
+                gs = epoch * len(loader) + step_in_epoch
+                sckdir = out_dir / 'step_ckpts'
+                sckdir.mkdir(parents=True, exist_ok=True)
+                torch.save({'epoch': epoch+1, 'global_step': gs, 'state_dict': model.state_dict(), 'loss': float(loss.item())},
+                           sckdir / f'step{gs:07d}.pt')
 
         avg_loss = float((epoch_loss / max(n_batches, 1)).item())
         avg_kept = float((epoch_kept / max(n_batches, 1)).item())
@@ -344,10 +448,11 @@ def pretrain(
 # Downstream evaluation: linear probe on forecasting
 # ─────────────────────────────────────────────────────────────────────────────
 
-def load_moment_with_ckpt(ckpt_path: Path, horizon: int, device: torch.device):
-    """Load MOMENT-small with forecasting head, injecting pretrained encoder weights."""
+def load_moment_with_ckpt(ckpt_path: Path, horizon: int, device: torch.device,
+                            model_size: str = 'small', full_ft: bool = False):
+    """Load MOMENT (size variant) with forecasting head, inject pretrained encoder."""
     model = MOMENTPipeline.from_pretrained(
-        'AutonLab/MOMENT-1-small',
+        f'AutonLab/MOMENT-1-{model_size}',
         model_kwargs={
             'task_name': 'reconstruction',
             'freeze_encoder': False,
@@ -371,7 +476,7 @@ def load_moment_with_ckpt(ckpt_path: Path, horizon: int, device: torch.device):
     model.init()
 
     for name, param in model.named_parameters():
-        param.requires_grad = 'head' in name
+        param.requires_grad = True if full_ft else ('head' in name)
 
     return model.to(device)
 
@@ -386,6 +491,8 @@ def eval_forecasting(
     probe_lr: float = 1e-4,
     batch_size: int = 64,
     train_frac: float = 1.0,
+    model_size: str = 'small',
+    full_ft: bool = False,
 ) -> dict:
     """Linear probe: freeze encoder/embedder, train only the forecasting head."""
     torch.manual_seed(seed)
@@ -406,7 +513,7 @@ def eval_forecasting(
         train_ds = Subset(train_ds, sorted(idxs.tolist()))
         print(f'  [few-shot] train_frac={train_frac}: kept {n_keep}/{n_full} samples')
 
-    model = load_moment_with_ckpt(ckpt_path, horizon, device)
+    model = load_moment_with_ckpt(ckpt_path, horizon, device, model_size=model_size, full_ft=full_ft)
 
     def run_loader(ds, shuffle):
         return DataLoader(ds, batch_size=batch_size, shuffle=shuffle,
@@ -457,9 +564,11 @@ def eval_forecasting(
     return {'dataset': dataset_name, 'horizon': horizon, 'test_mse': mse, 'test_mae': mae}
 
 
-def _moment_probe_eval_fn(ckpt_path, ds, h, *, seed, device, probe_epochs, train_frac=1.0):
-    return eval_forecasting(ckpt_path, ds, h, seed, device,
-                            probe_epochs=probe_epochs, train_frac=train_frac)
+def _moment_probe_eval_fn(ckpt_path, ds, h, *, seed, device, probe_epochs,
+                            train_frac=1.0, model_size='small', full_ft=False):
+    return eval_forecasting(ckpt_path, ds, h, seed, device, full_ft=full_ft,
+                            probe_epochs=probe_epochs, train_frac=train_frac,
+                            model_size=model_size)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -469,7 +578,9 @@ def _moment_probe_eval_fn(ckpt_path, ds, h, *, seed, device, probe_epochs, train
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--mode',
-                        choices=['baseline', 'patch_rho_cm', 'random_mask', 'eval', 'eval_sweep'],
+                        choices=['baseline', 'patch_rho_cm', 'random_mask',
+                                 'top_loss_drop', 'bottom_loss_drop',
+                                 'threshold_rho', 'eval', 'eval_sweep'],
                         default='patch_rho_cm')
 
     # Pretraining
@@ -480,6 +591,16 @@ def main():
                         help='%% of (sample, channel, patch) triples to drop (patch_rho_cm only)')
     parser.add_argument('--ref-epochs',  type=int,   default=3,
                         help='DLinear reference training epochs (patch_rho_cm only)')
+    parser.add_argument('--save-every-n-steps', type=int, default=None)
+    parser.add_argument('--threshold-tau', type=float, default=0.0,
+                        help='Fixed tau for threshold_rho mode (rho > tau kept)')
+    parser.add_argument('--univariate', action='store_true',
+                        help='OpenLTM-style SOM: unroll multivariate to univariate windows')
+    parser.add_argument('--model-size', choices=['small', 'base', 'large'], default='small',
+                        help='MOMENT-1-{small,base,large} variant from AutonLab')
+    parser.add_argument('--target-keep-pct', type=float, default=None,
+                        help='If set, calibrate threshold_tau via initial-batch percentile')
+    parser.add_argument('--calib-batches', type=int, default=200)
     parser.add_argument('--max-series',  type=int,   default=None,
                         help='Limit number of UTSD series (for quick tests)')
     parser.add_argument('--out-dir',     type=str,   default=None)
@@ -490,6 +611,8 @@ def main():
     parser.add_argument('--eval-dataset',    type=str, default='ETTh1')
     parser.add_argument('--eval-horizon',    type=int, default=96)
     parser.add_argument('--probe-epochs',    type=int, default=1)
+    parser.add_argument('--full-ft',         action='store_true',
+                        help='Full fine-tuning (unfreeze encoder)')
     parser.add_argument('--train-frac',      type=float, default=1.0,
                         help='Fraction of training data to use for linear probe (few-shot)')
     parser.add_argument('--probe-lr',        type=float, default=1e-4)
@@ -541,6 +664,8 @@ def main():
                 device       = device,
                 probe_epochs = args.probe_epochs,
                 train_frac   = args.train_frac,
+                model_size   = args.model_size,
+                full_ft      = args.full_ft,
             )
     else:
         pretrain(
@@ -554,6 +679,12 @@ def main():
             seed=args.seed,
             max_series=args.max_series,
             device=device,
+            threshold_tau=args.threshold_tau,
+            univariate=args.univariate,
+            model_size=args.model_size,
+            target_keep_pct=args.target_keep_pct,
+            save_every_n_steps=args.save_every_n_steps,
+            calib_batches=args.calib_batches,
         )
 
 

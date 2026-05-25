@@ -1,179 +1,164 @@
-# RHO-CM: Reference-Hard Online Channel Masking for Time-Series Foundation Model Pretraining
+# Selective Pretraining Masking (SPM) for Time-Series Foundation Models
 
-This directory contains the official implementation of RHO-CM applied to three
-representative time-series foundation models — **Moirai**, **MOMENT**, and
-**Timer** — pretrained on **UTSD-12G**.
+> Pretraining-time token selection that drops easy examples and keeps only
+> tokens where the foundation model's current loss exceeds a small reference
+> model's loss. Applied to **Timer**, **MOMENT**, and **TimesFM 1.0**.
 
-## Repository structure
+## TL;DR
+
+For each pretraining example we compute
+
+$$
+\rho[u] = L_{\text{current}}[u] - L_{\text{ref}}[u]
+$$
+
+with a lightweight DLinear reference, and at every step we keep only tokens
+with $\rho[u] > \tau$ — where $\tau$ is calibrated once on the first 200
+batches to hit a target keep ratio $k$.
+
+| Model | Params | Architecture | Best $k$ | Zero-shot $\Delta$MSE vs baseline |
+|---|---|---|---|---|
+| **Timer** | 84M | Causal decoder | 0.4 | **−6.94 %** (win 23/24) |
+| **MOMENT** | 35M | BERT-style encoder + recon | 0.6 | **−1.43 %** (win 19/24) |
+| **TimesFM 1.0** | 203M | Patched decoder + quantile head | 0.4 | **−8.80 %** (win 21/24) |
+
+All numbers averaged over 6 benchmark datasets
+(ETTh1, ETTh2, ETTm1, ETTm2, weather, exchange) and 4 horizons (96 / 192 / 336 / 720).
+
+See [`docs/01_method.md`](docs/01_method.md) for the method writeup and
+[`docs/03_timer_results.md`](docs/03_timer_results.md) for the Timer sweep.
+
+## Repo layout
 
 ```
 rho_pretrain/
 ├── README.md
 ├── requirements.txt
+├── docs/                      # method writeup + experiment notes
 ├── scripts/
-│   ├── pretrain_moirai.py       # Moirai-small + token-level RHO-CM
-│   ├── pretrain_moment.py       # MOMENT-small + patch-level RHO-CM
-│   └── pretrain_timer.py        # Timer-base + RHO-CM
-├── rho_lib/                     # Shared scaffolding (data, ref-loss, rho-mask, eval, train)
-│   ├── data/
-│   │   ├── utsd.py              # UTSDPretrainDataset, make_collate_fn, compute_channel_cap
-│   │   └── forecast.py          # ETT/electricity/traffic/weather/exchange/ILI/ECL splits
-│   ├── ref/
-│   │   ├── dlinear_normal.py    # Moirai reference: Normal NLL
-│   │   ├── dlinear_recon.py     # MOMENT reference: MSE reconstruction
-│   │   └── dlinear_causal.py    # Timer reference: causal next-patch MSE
-│   ├── rho/mask.py              # safe_quantile, compute_rho_mask
-│   ├── eval/{sweep,reporting}.py
-│   └── train/{schedule,checkpointing}.py
-└── data/                        # see "Data" section
+│   ├── pretrain_timer.py      # Timer pretrain (baseline + SPM variants)
+│   ├── pretrain_moment.py     # MOMENT pretrain
+│   ├── pretrain_timesfm.py    # TimesFM 1.0 pretrain (random-init 200M)
+│   ├── timer_fewshot.py       # Timer few-shot fine-tuning
+│   ├── timesfm_fewshot.py     # TimesFM few-shot fine-tuning
+│   ├── postprocess_run.py
+│   └── sweep/                 # plotting + sweep helpers
+├── rho_lib/
+│   ├── data/                  # UTSD loader + forecast eval datasets
+│   ├── eval/                  # sweep harness + result tables
+│   ├── ref/                   # DLinear reference (causal / mse / recon-masked)
+│   ├── rho/                   # top-K ρ mask
+│   ├── train/                 # checkpoint + LR schedule helpers
+│   └── _timesfm_v1_src/       # TimesFM v1 PyTorch source (vendored)
+├── data/                      # UTSD-12G + benchmark CSVs
+├── logs/                      # ckpts + eval JSONs
+└── plots/                     # generated figures (loss curves, sweeps, etc.)
 ```
 
-## Setup
+## Quick start
+
+### Environment
+
+Two conda environments are required (transformers version conflict between
+MOMENT and TimesFM):
 
 ```bash
-# 1. Conda environment (Python 3.10)
-conda create -n rho_pretrain -c conda-forge python=3.10 pip -y
-conda activate rho_pretrain
+# Timer + MOMENT
+conda create -n gracm python=3.10 -y
+conda activate gracm
+pip install -r requirements.txt
 
-# 2. PyTorch (CUDA 12.4 wheel)
-pip install torch==2.4.1 torchvision==0.19.1 \
-    --index-url https://download.pytorch.org/whl/cu124
-
-# 3. Remaining dependencies
+# TimesFM
+conda create -n gracm_ttm python=3.11 -y
+conda activate gracm_ttm
 pip install -r requirements.txt
 ```
 
-Tested on H200 NVL (CUDA 12.8 driver / 12.4 toolkit). The pinned versions of
-`momentfm 0.1.4`, `transformers 4.33.3`, and `uni2ts 2.0.0` are mutually
-compatible — do not upgrade individually.
-
-## Data
-
-### Pretraining: UTSD-12G
-
-Save the HuggingFace UTSD-12G dataset to `data/utsd_repo/UTSD-12G/` so it can
-be loaded via `datasets.load_from_disk`. The expected layout is 80 `.arrow`
-shards plus `dataset_info.json` and `state.json`, totalling ≈ 290k rows /
-3.9 GB. Source: https://huggingface.co/datasets/thuml/UTSD .
-
-### Evaluation: forecasting benchmarks
-
-Place the following CSVs under `data/`:
-
-```
-data/ETT-small/{ETTh1,ETTh2,ETTm1,ETTm2}.csv
-data/electricity/electricity.csv
-data/traffic/traffic.csv
-data/weather/weather.csv
-data/Exchange/Exchange.csv
-data/ILI/ILI.csv
-data/ECL/ECL.csv
-```
-
-Standard sources (Informer / Autoformer benchmark suite). Splits are computed
-inside [rho_lib/data/forecast.py](rho_lib/data/forecast.py) following the
-canonical ETT split rules (12-month train / 4-month val / 4-month test for
-ETT; 70/10/20 for the rest).
-
-## Reproducing main results
-
-### Pretraining
+### Pretraining (best SPM config per model)
 
 ```bash
-# Moirai-small (14 M params)
-python scripts/pretrain_moirai.py --mode baseline --epochs 5 --batch-size 32
-python scripts/pretrain_moirai.py --mode rho_cm   --epochs 5 --batch-size 32 \
-    --ref-epochs 3 --drop-pct 10
+# Timer baseline
+python scripts/pretrain_timer.py --mode baseline --univariate \
+    --epochs 3 --batch-size 512 --lr 3e-4 --seed 42 --out-dir <dir>
 
-# MOMENT-small (37 M params)
-python scripts/pretrain_moment.py --mode baseline --epochs 2 --batch-size 64
-python scripts/pretrain_moment.py --mode patch_rho_cm --epochs 2 --batch-size 64 \
-    --ref-epochs 3 --drop-pct 10
+# Timer SPM (calibrated, k=0.4)
+python scripts/pretrain_timer.py --mode threshold_rho --univariate \
+    --epochs 3 --batch-size 512 --lr 3e-4 \
+    --target-keep-pct 0.4 --calib-batches 200 --ref-epochs 2 \
+    --seed 42 --out-dir <dir>
 
-# Timer-base (84 M params)
-python scripts/pretrain_timer.py  --mode baseline --epochs 10 --batch-size 32
-python scripts/pretrain_timer.py  --mode rho_cm   --epochs 10 --batch-size 32 \
-    --ref-epochs 10 --drop-pct 10
+# MOMENT baseline
+python scripts/pretrain_moment.py --mode baseline --univariate \
+    --epochs 1 --batch-size 1024 --lr 1e-4 --seed 42 --out-dir <dir>
+
+# MOMENT SPM (k=0.6)
+python scripts/pretrain_moment.py --mode threshold_rho --univariate \
+    --epochs 1 --batch-size 1024 --lr 1e-4 \
+    --target-keep-pct 0.6 --calib-batches 200 --ref-epochs 2 \
+    --seed 42 --out-dir <dir>
+
+# TimesFM baseline
+python scripts/pretrain_timesfm.py --mode baseline \
+    --epochs 1 --batch-size 128 --lr 5e-6 --seed 42 --out-dir <dir>
+
+# TimesFM SPM (k=0.4)
+python scripts/pretrain_timesfm.py --mode threshold_rho \
+    --epochs 1 --batch-size 128 --lr 5e-6 \
+    --target-keep-pct 0.4 --calib-batches 200 --ref-epochs 2 \
+    --seed 42 --out-dir <dir>
 ```
 
-Checkpoints are written to `results_<model>/<mode>/{epoch%03d.pt, best.pt, metrics.json}`.
-
-### Evaluation
+### Zero-shot evaluation
 
 ```bash
-# Linear probe (Moirai, MOMENT)
-python scripts/pretrain_moirai.py --mode eval_sweep \
-    --baseline-ckpt results_moirai/baseline/best.pt \
-    --rho-cm-ckpt   results_moirai/rho_cm/best.pt
-
-python scripts/pretrain_moment.py --mode eval_sweep \
-    --baseline-ckpt     results_pretrain/baseline/best.pt \
-    --patch-rho-cm-ckpt results_pretrain/patch_rho_cm/best.pt
-
-# Zero-shot (Moirai, Timer)
-python scripts/pretrain_moirai.py --mode eval_zero_shot_sweep \
-    --baseline-ckpt results_moirai/baseline/best.pt \
-    --rho-cm-ckpt   results_moirai/rho_cm/best.pt
-
-python scripts/pretrain_timer.py  --mode eval_zero_shot_sweep \
-    --baseline-ckpt results_timer/baseline/best.pt \
-    --rho-cm-ckpt   results_timer/rho_cm/best.pt
+python scripts/pretrain_<model>.py --mode eval_zero_shot_sweep \
+    --baseline-ckpt <baseline.pt> --rho-cm-ckpt <spm.pt> \
+    --eval-datasets ETTh1,ETTh2,ETTm1,ETTm2,weather,exchange \
+    --eval-horizons 96,192,336,720 \
+    --out-dir <eval_dir>
 ```
 
-Each sweep prints a `(dataset × horizon)` MSE/MAE table for every checkpoint,
-followed by Δ-vs-baseline rows, and writes `*_results.json` to the chosen
-`--out-dir`.
+### Few-shot fine-tuning
 
-## RHO-CM in one paragraph
+```bash
+# Timer (full-FT, lr=1e-6, epochs=3)
+python scripts/timer_fewshot.py --full-ft \
+    --baseline-ckpt <baseline.pt> --rho-cm-ckpt <spm.pt> \
+    --train-frac 0.01 --epochs 3 --batch-size 32 --lr 1e-6 \
+    --out-json <out.json>
 
-RHO-CM scores each *learning unit* of the model's loss by the gap to a small
-DLinear reference trained on the same corpus, and drops the bottom `drop_pct%`
-units per batch (the ones the model already handles as well as DLinear).
-The granularity matches each backbone's loss aggregation:
+# TimesFM (full-FT, lr=1e-6, epochs=10)
+python scripts/timesfm_fewshot.py --full-ft \
+    --baseline-ckpt <baseline.pt> --rho-cm-ckpt <spm.pt> \
+    --train-frac 0.01 --epochs 10 --batch-size 32 --lr 1e-6 \
+    --out-json <out.json>
+```
 
-- **Moirai**: per **token** (sample × variate × time-patch), Normal NLL ref.
-- **MOMENT**: per **patch** (sample × channel × patch), MSE-recon ref.
-- **Timer**:  per **token** (sample × channel × position), causal next-patch
-  MSE ref.
+## Dependencies (key versions)
 
-In every case `ρ[u] = current_loss[u] − ref_loss[u]` — units with the lowest
-gap (model is already as good as DLinear) are weighted out of the loss.
+| Package | gracm | gracm_ttm |
+|---|---|---|
+| python | 3.10 | 3.11 |
+| torch | 2.4.1 + cu121 | 2.10 + cu128 |
+| transformers | 4.33.3 | 4.49.0 |
+| momentfm | 0.1.x | — |
+| granite-tsfm | — | 0.2.28 |
 
-## CLI reference (common flags)
+## License
 
-| Flag | Meaning |
-|------|---------|
-| `--mode {baseline,rho_cm,...}` | training/eval mode (see each script's `--help`) |
-| `--epochs`, `--batch-size`, `--lr` | core training schedule |
-| `--ref-epochs` | DLinear reference training epochs (rho_cm only) |
-| `--drop-pct` | % of learning units (token/patch) to drop per batch (rho_cm only) |
-| `--max-series` | cap on UTSD source series (for quick tests) |
-| `--max-windows` | cap on training windows (Timer only) |
-| `--seed` | RNG seed (default 42) |
-| `--out-dir` | output directory (default `results_<model>/<mode>`) |
+This repository contains:
+- Original SPM code: Apache 2.0.
+- Vendored TimesFM v1 PyTorch source (`rho_lib/_timesfm_v1_src/`) by Google
+  Research, Apache 2.0.
+- MOMENT is loaded from `AutonLab/MOMENT-1-{small,base,large}` on HuggingFace.
 
-## Notes
+## Citation
 
-- Moirai's [scripts/pretrain_moirai.py](scripts/pretrain_moirai.py) follows the official
-  `cli/conf/pretrain/model/moirai_small.yaml` recipe: 4-component mixture
-  output (StudentT, NormalFixedScale, NegativeBinomial, LogNormal),
-  per-sample patch-size sampling over `{8, 16, 32, 64, 128}`, suffix-only
-  prediction mask, randomized variate IDs in `[0, 128)`,
-  decay/no-decay parameter group split with `wd = 0.1`,
-  10k-step linear warmup + cosine-with-restarts.
-- Moirai applies RHO-CM at the **token granularity** — matching the unit
-  Moirai's `PackedNLLLoss` aggregates over. The DLinear reference produces a
-  `(N_windows, C99, SEQ_LEN)` per-time-step NLL table; the training loop
-  averages it over each token's actual `patch_size` (sampled per-sample from
-  `{8, 16, 32, 64, 128}`) so the reference is patch-size-agnostic.
-- MOMENT applies RHO-CM at the patch granularity: per-(sample, channel, patch)
-  reconstruction MSE compared against a DLinear reference, with bottom-N%
-  triples dropped per batch (`patch_rho_cm`).
-- Timer applies RHO-CM at the token granularity: per-(sample, channel,
-  position) next-patch MSE.
-- Timer caps channels at the 99th percentile (`compute_channel_cap`) to keep
-  `N_real × num_heads` under CUDA's grid limit on heavy multivariate series
-  (traffic 862 ch, ECL 321 ch).
-- The reference-loss table is moved to GPU once when it fits (2 GB threshold
-  for Timer/MOMENT, 4 GB for Moirai's larger time-step table), avoiding
-  per-batch CPU↔GPU copies in the training loop.
+```bibtex
+@article{spm_tsfm_2026,
+  title  = {Selective Pretraining Masking for Time-Series Foundation Models},
+  author = {Anonymous},
+  year   = {2026},
+  note   = {NeurIPS submission}
+}
+```

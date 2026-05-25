@@ -1,35 +1,33 @@
-"""
-Timer Pretraining with RHO-CM Channel Masking.
+"""Timer pretraining (baseline + SPM variants).
 
-Architecture : Decoder-only causal Transformer (GPT-style)
-               Channel-independent (each channel treated as univariate)
-               Patch-based next-token prediction with MSE loss
-               RoPE positional embeddings
+Architecture
+------------
+Decoder-only causal Transformer (GPT-style), channel-independent.
+Patch-based next-token prediction with MSE loss, RoPE positional embeddings.
+Random-init from `OpenLTM/Timer-base` config (~84M params, patch_len=96).
 
-Baseline : Timer-base (random init) + next-patch MSE prediction
-Ours     : Timer-base + RHO-CM channel masking
-           rho[i, c] = current_mse[i, c] - ref_mse[i, c]
-           Drop bottom drop_pct% (sample, channel) pairs per batch.
-           ref = DLinear trained briefly (ref_epochs) on the same corpus.
-
-Usage
+Modes
 -----
-# Baseline
-python pretrain_timer.py --mode baseline --epochs 3 --batch-size 32
+- baseline          : standard next-patch MSE (no selection).
+- threshold_rho     : SPM with calibrated threshold τ.
+                      Keep tokens with ρ = current_MSE − ref_MSE > τ.
+                      τ is fit on the first `--calib-batches` to hit
+                      `--target-keep-pct` (k).
+- random_mask       : ablation, random per-token mask matching `--drop-pct`.
+- top_loss_drop     : ablation, drop tokens with the highest current loss.
+- bottom_loss_drop  : ablation, drop tokens with the lowest current loss.
 
-# RHO-CM
-python pretrain_timer.py --mode rho_cm --epochs 3 --batch-size 32 \
-    --ref-epochs 10 --drop-pct 10
+Reference model: causal next-patch DLinear (see rho_lib/ref/dlinear_causal.py),
+trained briefly on the same UTSD corpus for `--ref-epochs` epochs.
 
-# Zero-shot eval
-python pretrain_timer.py --mode eval_zero_shot \
-    --ckpt results_timer/baseline/best.pt \
-    --eval-dataset ETTh1 --eval-horizon 96
+Eval
+----
+- eval_zero_shot, eval_zero_shot_sweep : direct forecasting on benchmark datasets.
 
-# Sweep
-python pretrain_timer.py --mode eval_zero_shot_sweep \
-    --baseline-ckpt results_timer/baseline/best.pt \
-    --rho-cm-ckpt   results_timer/rho_cm/best.pt
+Best config (see paper Table N)
+-------------------------------
+baseline       : --epochs 3 --batch-size 512 --lr 3e-4
+SPM (calib)    : same + --target-keep-pct 0.4 --calib-batches 200 --ref-epochs 2
 """
 
 import argparse
@@ -54,6 +52,8 @@ from tqdm import tqdm
 # ── rho_lib (shared scaffolding) ──────────────────────────────────────────────
 from rho_lib.data.utsd     import (
     UTSDPretrainDataset, make_collate_fn, load_utsd, compute_channel_cap,
+    UTSDPretrainDatasetUnivariate, make_collate_fn_univariate,
+    load_or_build_cached_univariate,
 )
 from rho_lib.data.forecast import prepare_forecast_datasets
 from rho_lib.ref.dlinear_causal import build_ref_loss_causal
@@ -241,29 +241,46 @@ class TimerModel(nn.Module):
 def pretrain(
     mode, epochs, batch_size, lr, drop_pct, ref_epochs,
     out_dir, seed, max_series, max_windows, device,
+    lambda_clip_max=None, meta_lr=1e-2, init_lambda=1.0,
+    threshold_tau=0.0, univariate=False,
+    target_keep_pct=None, calib_batches=200,
+    save_every_n_steps=None,
 ):
     torch.manual_seed(seed); random.seed(seed); np.random.seed(seed)
     out_dir.mkdir(parents=True, exist_ok=True)
 
     # ── Dataset ───────────────────────────────────────────────────────────────
-    print('[Data] Loading UTSD...')
-    hf_ds = load_utsd(UTSD_PATH, max_series=max_series)
-    print(f'[Data] {len(hf_ds):,} rows loaded')
-    dataset = UTSDPretrainDataset(
-        hf_ds, seq_len=SEQ_LEN, stride=SEQ_LEN,
-        max_series=max_series, max_windows=max_windows,
-        standardize_per_series=True,                # Timer default: pre-norm
-    )
-
-    # Cap channels at 99-percentile to bound N_real per batch. Heavy MVTS
-    # series (traffic 862ch, ECL 321ch) otherwise produce N_real * 8 heads
-    # > 65535, which exceeds CUDA's grid Y dim limit and crashes SDPA.
-    channel_cap = compute_channel_cap(dataset, percentile=99.0, per='window')
-    print(f'[Data] channel cap (p99): {channel_cap}; capping at p99')
+    if univariate:
+        # OpenLTM-style SOM: each (series, channel) becomes a univariate window.
+        # Uses pickle cache so 4-min HF iteration is paid once across all runs
+        # with the same (seq_len, stride, standardize, max_series) config.
+        dataset = load_or_build_cached_univariate(
+            UTSD_PATH, seq_len=SEQ_LEN, stride=SEQ_LEN,
+            standardize_per_series=True,
+            max_series=max_series, max_windows=max_windows,
+        )
+        channel_cap = 1   # each batch item is already (1, sl)
+        print(f'[Data] univariate mode (SOM): {len(dataset)} windows, no channel cap')
+        collate = make_collate_fn_univariate(SEQ_LEN)
+    else:
+        print('[Data] Loading UTSD...')
+        hf_ds = load_utsd(UTSD_PATH, max_series=max_series)
+        print(f'[Data] {len(hf_ds):,} rows loaded')
+        dataset = UTSDPretrainDataset(
+            hf_ds, seq_len=SEQ_LEN, stride=SEQ_LEN,
+            max_series=max_series, max_windows=max_windows,
+            standardize_per_series=True,                # Timer default: pre-norm
+        )
+        # Cap channels at 99-percentile to bound N_real per batch. Heavy MVTS
+        # series (traffic 862ch, ECL 321ch) otherwise produce N_real * 8 heads
+        # > 65535, which exceeds CUDA's grid Y dim limit and crashes SDPA.
+        channel_cap = compute_channel_cap(dataset, percentile=99.0, per='window')
+        print(f'[Data] channel cap (p99): {channel_cap}; capping at p99')
+        collate = make_collate_fn(SEQ_LEN, channel_cap)
 
     loader = DataLoader(
         dataset, batch_size=batch_size, shuffle=True,
-        num_workers=0, collate_fn=make_collate_fn(SEQ_LEN, channel_cap),
+        num_workers=0, collate_fn=collate,
         pin_memory=False, drop_last=True,
     )
     print(f'[Data] {len(loader)} batches/epoch')
@@ -292,7 +309,7 @@ def pretrain(
 
     # ── RHO-CM reference ──────────────────────────────────────────────────────
     ref_loss_table = None
-    if mode == 'rho_cm':
+    if mode in ('rho_cm', 'soft_rho_learnable', 'soft_rho_fixed', 'threshold_rho'):
         t0 = time.time()
         # Timer's ref builder: causal next-patch DLinear with capped collate
         ref_collate = make_collate_fn(SEQ_LEN, channel_cap=channel_cap)
@@ -314,15 +331,71 @@ def pretrain(
             ref_loss_table = ref_loss_table.pin_memory()
             print(f'[RHO-CM] ref table on pinned CPU ({ref_bytes/1e6:.1f} MB)')
 
+    # ── Learnable lambda (soft_rho_learnable only) ───────────────────────────
+    # Use separate Adam optimizer so it doesn't interact with the model's
+    # warmup-cosine LambdaLR scheduler (which is registered for one param group).
+    if mode == 'soft_rho_learnable':
+        lambda_ref = nn.Parameter(torch.tensor(float(init_lambda), device=device))
+        log_temp   = nn.Parameter(torch.tensor(0.0, device=device))  # temp = exp(log_temp), init = 1.0
+        meta_optimizer = torch.optim.Adam([lambda_ref, log_temp], lr=meta_lr)
+        print(f'[soft_rho_learnable] lambda init={init_lambda}, temp init=1.0  '
+              f'meta_lr={meta_lr}  clip_max={lambda_clip_max}')
+    else:
+        lambda_ref = None
+        log_temp   = None
+        meta_optimizer = None
+
     # ── Training ──────────────────────────────────────────────────────────────
-    metrics   = {'train_loss': [], 'kept_ratio': []}
+    metrics   = {'train_loss': [], 'kept_ratio': [], 'lambda': [], 'temp': []}
     best_loss = float('inf')
 
     # Per-step loss log for convergence plots (separate from tqdm)
     step_log_path = out_dir / 'step_loss.csv'
     step_log_f = open(step_log_path, 'w')
-    step_log_f.write('step,loss,kept_ratio\n')
+    step_log_f.write('step,loss,kept_ratio,lambda,temp\n')
     step_log_every = 10  # write every N steps to keep file small
+
+    # ── Calibration: estimate threshold_tau from initial rho distribution ────
+    if mode == 'threshold_rho' and target_keep_pct is not None and ref_loss_table is not None:
+        print(f'[Calib] target_keep_pct={target_keep_pct} '
+              f'collecting rho from first {calib_batches} batches (no grad)...')
+        t0 = time.time()
+        rho_samples = []
+        model.eval()
+        calib_loader = loader   # reuse same loader, just take first N batches
+        with torch.no_grad():
+            for bi, (indices, x, ch_mask) in enumerate(calib_loader):
+                if bi >= calib_batches:
+                    break
+                indices = indices.to(device); x = x.to(device); ch_mask = ch_mask.to(device)
+                B, C_max, T = x.shape
+                n_patches_b = T // PATCH_LEN
+                real_idx_b = ch_mask.nonzero(as_tuple=False)
+                if real_idx_b.shape[0] == 0:
+                    continue
+                b_idx_b, c_idx_b = real_idx_b[:, 0], real_idx_b[:, 1]
+                x_real = x[b_idx_b, c_idx_b]
+                x_in = x_real.reshape(-1, n_patches_b, PATCH_LEN)
+                pred = model(x_in)
+                mse_pos_b = ((pred[:, :-1] - x_in[:, 1:]) ** 2).mean(dim=-1)
+                C_eff = min(C_max, ref_loss_table.shape[1])
+                in_eff = c_idx_b < C_eff
+                if in_eff.any():
+                    mse_eff = mse_pos_b[in_eff]
+                    b_eff = b_idx_b[in_eff]
+                    c_eff = c_idx_b[in_eff]
+                    if ref_loss_table.is_cuda:
+                        ref_pos = ref_loss_table[indices[b_eff], c_eff]
+                    else:
+                        ref_pos = ref_loss_table[indices[b_eff].cpu(), c_eff.cpu()].to(device)
+                    rho_b = (mse_eff - ref_pos).detach()
+                    rho_samples.append(rho_b.flatten().cpu())
+        model.train()
+        all_rho = torch.cat(rho_samples)
+        threshold_tau = torch.quantile(all_rho, 1.0 - target_keep_pct).item()
+        print(f'[Calib] threshold_tau={threshold_tau:.4f} (n_rho={len(all_rho)}, '
+              f'mean={all_rho.mean():.4f}, std={all_rho.std():.4f}) '
+              f'in {time.time()-t0:.1f}s')
 
     for epoch in range(epochs):
         model.train()
@@ -416,12 +489,100 @@ def pretrain(
                     loss = mse_pos.mean()
                     kept_ratio = torch.ones((), device=device)
 
+            elif mode == 'threshold_rho':
+                # Hard mask with FIXED threshold tau instead of fixed drop_pct.
+                # As model improves -> current_loss decreases -> rho shrinks ->
+                # fewer tokens pass tau => selected ratio drops over time
+                # (an emergent curriculum without scheduling).
+                C_eff   = min(C_max, ref_loss_table.shape[1])
+                in_eff  = c_idx < C_eff
+                if in_eff.any():
+                    mse_eff = mse_pos[in_eff]
+                    b_eff   = b_idx[in_eff]
+                    c_eff   = c_idx[in_eff]
+                    if ref_loss_table.is_cuda:
+                        ref_pos = ref_loss_table[indices[b_eff], c_eff]
+                    else:
+                        ref_pos = ref_loss_table[indices[b_eff].cpu(), c_eff.cpu()].to(device)
+                    rho_val   = mse_eff.detach() - ref_pos
+                    mask_bool = rho_val > threshold_tau
+                    if mask_bool.any():
+                        weighted = mse_eff * mask_bool.float()
+                        denom    = mask_bool.float().sum().clamp(min=1)
+                        loss     = weighted.sum() / denom
+                        kept_ratio = mask_bool.float().mean()
+                    else:
+                        # No token above threshold -> fall back to mean to avoid 0 grad
+                        loss = mse_eff.mean()
+                        kept_ratio = torch.zeros((), device=device)
+                else:
+                    loss = mse_pos.mean()
+                    kept_ratio = torch.ones((), device=device)
+
+            elif mode == 'soft_rho_fixed':
+                # Soft reweighting with FIXED lambda=1 and temp=1 (no learning).
+                # Compares soft mechanism vs hard top-K, isolating the soft
+                # weighting effect from learnable hyperparams.
+                C_eff   = min(C_max, ref_loss_table.shape[1])
+                in_eff  = c_idx < C_eff
+                if in_eff.any():
+                    mse_eff = mse_pos[in_eff]
+                    b_eff   = b_idx[in_eff]
+                    c_eff   = c_idx[in_eff]
+                    if ref_loss_table.is_cuda:
+                        ref_pos = ref_loss_table[indices[b_eff], c_eff]
+                    else:
+                        ref_pos = ref_loss_table[indices[b_eff].cpu(), c_eff.cpu()].to(device)
+                    rho_val = mse_eff.detach() - ref_pos     # lambda=1
+                    w       = torch.sigmoid(rho_val)         # temp=1
+                    weighted = mse_eff * w
+                    denom    = w.sum().clamp(min=1e-6)
+                    loss     = weighted.sum() / denom
+                    kept_ratio = w.mean()
+                else:
+                    loss = mse_pos.mean()
+                    kept_ratio = torch.ones((), device=device)
+
+            elif mode == 'soft_rho_learnable':
+                # Soft reweighting with learnable lambda + temperature.
+                # No hard top-K mask; all tokens contribute, weighted by
+                #   w = sigmoid((current - lambda * ref) / temp)
+                # lambda and temp are learned alongside model parameters.
+                C_eff   = min(C_max, ref_loss_table.shape[1])
+                in_eff  = c_idx < C_eff
+                if in_eff.any():
+                    mse_eff = mse_pos[in_eff]                                 # (N_eff, P-1)
+                    b_eff   = b_idx[in_eff]
+                    c_eff   = c_idx[in_eff]
+                    if ref_loss_table.is_cuda:
+                        ref_pos = ref_loss_table[indices[b_eff], c_eff]
+                    else:
+                        ref_pos = ref_loss_table[indices[b_eff].cpu(), c_eff.cpu()].to(device)
+                    # ρ uses detached current so lambda only learns through w
+                    rho_val = mse_eff.detach() - lambda_ref * ref_pos
+                    temp    = torch.exp(log_temp).clamp(min=1e-3, max=10.0)
+                    w       = torch.sigmoid(rho_val / temp)
+                    weighted = mse_eff * w
+                    denom    = w.sum().clamp(min=1e-6)
+                    loss     = weighted.sum() / denom
+                    kept_ratio = w.mean()
+                else:
+                    loss = mse_pos.mean()
+                    kept_ratio = torch.ones((), device=device)
+
             else:
                 raise ValueError(f'Unknown mode: {mode}')
 
             optimizer.zero_grad(set_to_none=True)
+            if meta_optimizer is not None:
+                meta_optimizer.zero_grad(set_to_none=True)
             loss.backward()
             optimizer.step()
+            if meta_optimizer is not None:
+                meta_optimizer.step()
+                if lambda_clip_max is not None:
+                    with torch.no_grad():
+                        lambda_ref.clamp_(min=0.0, max=lambda_clip_max)
             scheduler.step()
 
             epoch_loss += loss.detach()
@@ -430,8 +591,18 @@ def pretrain(
             step_in_epoch += 1
             if step_in_epoch % step_log_every == 0:
                 global_step = epoch * len(loader) + step_in_epoch
-                step_log_f.write(f'{global_step},{loss.item():.6f},{kept_ratio.item():.4f}\n')
+                lam_val = lambda_ref.item() if lambda_ref is not None else float('nan')
+                tmp_val = (torch.exp(log_temp).item()
+                           if log_temp is not None else float('nan'))
+                step_log_f.write(f'{global_step},{loss.item():.6f},{kept_ratio.item():.4f},{lam_val:.4f},{tmp_val:.4f}\n')
                 step_log_f.flush()
+            # Step-level checkpoint for Rho-1 style learning curve
+            if save_every_n_steps is not None and (epoch * len(loader) + step_in_epoch) % save_every_n_steps == 0:
+                gs = epoch * len(loader) + step_in_epoch
+                sckdir = out_dir / 'step_ckpts'
+                sckdir.mkdir(parents=True, exist_ok=True)
+                torch.save({'epoch': epoch+1, 'global_step': gs, 'state_dict': model.state_dict(), 'loss': float(loss.item())},
+                           sckdir / f'step{gs:07d}.pt')
 
         # scheduler is per-step now (LambdaLR); no per-epoch step here
         avg_loss = float((epoch_loss / max(n_batches, 1)).item())
@@ -575,6 +746,8 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--mode', choices=['baseline', 'rho_cm', 'random_mask',
                                            'top_loss_drop', 'bottom_loss_drop',
+                                           'soft_rho_learnable', 'soft_rho_fixed',
+                                           'threshold_rho',
                                            'eval_zero_shot', 'eval_zero_shot_sweep'],
                         default='baseline')
     parser.add_argument('--epochs',      type=int,   default=10)      # OpenLTM train_epochs=10
@@ -597,6 +770,21 @@ def main():
     parser.add_argument('--baseline-ckpt',   type=str, default=None)
     parser.add_argument('--rho-cm-ckpt',     type=str, default=None)
     parser.add_argument('--context-length',  type=int, default=SEQ_LEN)
+    # soft_rho_learnable specific
+    parser.add_argument('--lambda-clip-max', type=float, default=None,
+                        help='If set, clamp lambda_ref to [0, max] each step')
+    parser.add_argument('--meta-lr',         type=float, default=1e-2,
+                        help='lr for learnable lambda + temp (soft mode)')
+    parser.add_argument('--init-lambda',     type=float, default=1.0,
+                        help='Initial value of lambda_ref (soft mode)')
+    parser.add_argument('--save-every-n-steps', type=int, default=None)
+    parser.add_argument('--threshold-tau',   type=float, default=0.0,
+                        help='Fixed tau for threshold_rho mode (rho > tau kept)')
+    parser.add_argument('--univariate', action='store_true',
+                        help='OpenLTM-style SOM: unroll multivariate to univariate windows')
+    parser.add_argument('--target-keep-pct', type=float, default=None,
+                        help='If set, calibrate threshold_tau via initial-batch percentile')
+    parser.add_argument('--calib-batches', type=int, default=200)
 
     args   = parser.parse_args()
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -606,7 +794,9 @@ def main():
         args.out_dir = f'results_timer/{args.mode}'
 
     if args.mode in ('baseline', 'rho_cm', 'random_mask',
-                     'top_loss_drop', 'bottom_loss_drop'):
+                     'top_loss_drop', 'bottom_loss_drop',
+                     'soft_rho_learnable', 'soft_rho_fixed',
+                     'threshold_rho'):
         pretrain(
             mode       = args.mode,
             epochs     = args.epochs,
@@ -619,6 +809,14 @@ def main():
             max_series = args.max_series,
             max_windows = args.max_windows,
             device     = device,
+            lambda_clip_max = args.lambda_clip_max,
+            meta_lr         = args.meta_lr,
+            init_lambda     = args.init_lambda,
+            threshold_tau   = args.threshold_tau,
+            univariate      = args.univariate,
+            target_keep_pct = args.target_keep_pct,
+            calib_batches   = args.calib_batches,
+            save_every_n_steps = args.save_every_n_steps,
         )
     elif args.mode == 'eval_zero_shot':
         eval_zero_shot(
